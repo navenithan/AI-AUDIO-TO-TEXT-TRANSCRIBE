@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+*.egg-info/
+dist/
+build/
+
+# Environment variables
+.env
+
+# Audio files
+*.wav
+*.mp3
+*.m4a
+*.flac
+*.ogg
+
+# Video files
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.mpeg
+*.mpga
+*.webm
+*.wmv
+*.flv
+
+# Extracted audio files
+*.extracted.mp3
+
+# Transcripts
+*_transcript.txt
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Model cache
+.cache/
+models/
