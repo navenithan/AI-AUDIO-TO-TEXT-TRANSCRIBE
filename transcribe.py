@@ -3,13 +3,26 @@
 Speech-to-Text Transcription with Speaker Diarization
 Supports: wav, mp3, m4a, flac, ogg, mp4, mpeg, mpga, webm, avi, mov, mkv
 Uses OpenAI's gpt-4o-transcribe-diarize model
+
+Features:
+  - Single file or batch processing
+  - Smart transcript cleaning (filler word removal)
+  - Advanced AI summaries (key points, action items, Q&A)
+  - Content analysis (topics, keywords, entities)
+  - Cost estimation
+  - Confidence scoring
+  - Interactive mode
 """
 
 import argparse
+import glob
+import json
 import os
+import re
 import sys
+import time
 from pathlib import Path
-from typing import List, Dict
+from typing import List, Dict, Optional
 
 try:
     from openai import OpenAI
@@ -22,37 +35,93 @@ except ImportError as e:
 # Load environment variables from .env file
 load_dotenv()
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Pricing (USD per minute) — update if OpenAI changes rates
+# https://openai.com/api/pricing
+# ──────────────────────────────────────────────────────────────────────────────
+MODEL_COST_PER_MINUTE = {
+    "gpt-4o-transcribe-diarize": 0.06,   # $0.06 / min (estimated)
+    "gpt-4o-transcribe":         0.06,
+    "gpt-4o-mini-transcribe":    0.03,
+    "whisper-1":                 0.006,
+}
+GPT4O_MINI_COST_PER_1K_INPUT  = 0.00015   # for summaries / analysis
+GPT4O_MINI_COST_PER_1K_OUTPUT = 0.0006
+
+# Filler words to strip during cleaning
+FILLER_WORDS = {
+    "um", "uh", "umm", "uhh", "erm", "ah", "ahh",
+    "hmm", "hm", "mm", "mmm", "mhm", "uh-huh",
+    "you know", "i mean", "like", "sort of", "kind of",
+    "basically", "actually", "literally", "right",
+}
+# Build a regex that matches whole-word fillers (case-insensitive)
+_filler_pattern = re.compile(
+    r'\b(?:' + '|'.join(re.escape(f) for f in sorted(FILLER_WORDS, key=len, reverse=True)) + r')\b',
+    re.IGNORECASE,
+)
+
+
+class CostTracker:
+    """Track estimated API costs across operations."""
+
+    def __init__(self):
+        self.transcription_cost = 0.0
+        self.analysis_cost = 0.0
+
+    def add_transcription(self, duration_seconds: float, model: str):
+        rate = MODEL_COST_PER_MINUTE.get(model, 0.06)
+        self.transcription_cost += (duration_seconds / 60) * rate
+
+    def add_chat_tokens(self, input_tokens: int, output_tokens: int):
+        self.analysis_cost += (input_tokens / 1000) * GPT4O_MINI_COST_PER_1K_INPUT
+        self.analysis_cost += (output_tokens / 1000) * GPT4O_MINI_COST_PER_1K_OUTPUT
+
+    @property
+    def total(self) -> float:
+        return self.transcription_cost + self.analysis_cost
+
+    def summary(self) -> str:
+        return (
+            f"Transcription: ${self.transcription_cost:.4f}  |  "
+            f"Analysis: ${self.analysis_cost:.4f}  |  "
+            f"Total: ${self.total:.4f}"
+        )
+
 
 class AudioTranscriber:
     """Handles audio transcription and speaker diarization using OpenAI API."""
-    
+
     # Native OpenAI supported formats
     SUPPORTED_AUDIO_FORMATS = {'.wav', '.mp3', '.m4a', '.flac', '.ogg', '.mp4', '.mpeg', '.mpga', '.webm'}
-    
+
     # Video formats that require audio extraction
     SUPPORTED_VIDEO_FORMATS = {'.avi', '.mov', '.mkv', '.wmv', '.flv'}
-    
+
     def __init__(self, api_key: str = None):
         """Initialize transcriber with API credentials."""
         self.api_key = api_key or os.getenv('OPENAI_API_KEY')
-        
+
         if not self.api_key:
             raise ValueError("OpenAI API key not found. Set OPENAI_API_KEY environment variable.")
-        
+
         self.client = OpenAI(api_key=self.api_key)
-    
+        self.cost = CostTracker()
+
+    # ── File helpers ──────────────────────────────────────────────────────────
+
     def validate_file(self, file_path: Path) -> None:
         """Validate audio/video file exists and has supported format."""
         if not file_path.exists():
             raise FileNotFoundError(f"File not found: {file_path}")
-        
+
         suffix = file_path.suffix.lower()
         if suffix not in (self.SUPPORTED_AUDIO_FORMATS | self.SUPPORTED_VIDEO_FORMATS):
             raise ValueError(
                 f"Unsupported format: {file_path.suffix}. "
                 f"Supported formats: {', '.join(self.SUPPORTED_AUDIO_FORMATS | self.SUPPORTED_VIDEO_FORMATS)}"
             )
-    
+
     def extract_audio_from_video(self, video_path: Path) -> Path:
         """Extract audio from video file to MP3 format."""
         try:
@@ -62,295 +131,720 @@ class AudioTranscriber:
                 "moviepy is required for video audio extraction. "
                 "Install it with: pip install moviepy"
             )
-        
-        print(f"Extracting audio from video: {video_path.name}")
-        
+
+        print(f"  Extracting audio from video: {video_path.name}")
+
         try:
             audio_path = video_path.with_suffix('.extracted.mp3')
-            
-            # Load video and extract audio
             video = VideoFileClip(str(video_path))
             video.audio.write_audiofile(str(audio_path), logger=None)
             video.close()
-            
-            print(f"Audio extracted to: {audio_path.name}")
+            print(f"  Audio extracted to: {audio_path.name}")
             return audio_path
-            
         except Exception as e:
             raise RuntimeError(f"Failed to extract audio from video: {e}")
-    
+
+    # ── Cost estimation ───────────────────────────────────────────────────────
+
+    def estimate_cost(self, file_path: Path, model: str) -> Dict:
+        """Estimate cost before processing."""
+        try:
+            from mutagen import File as MutagenFile
+            audio_info = MutagenFile(str(file_path))
+            duration = audio_info.info.length if audio_info and audio_info.info else 0
+        except Exception:
+            # Rough estimate from file size (assume ~1MB per minute for compressed audio)
+            file_size_mb = file_path.stat().st_size / (1024 * 1024)
+            duration = file_size_mb * 60  # rough guess
+
+        rate = MODEL_COST_PER_MINUTE.get(model, 0.06)
+        transcription_cost = (duration / 60) * rate
+        # Estimate analysis cost (summary + content analysis ≈ 2K tokens in + 1K out)
+        analysis_cost = (2 * GPT4O_MINI_COST_PER_1K_INPUT) + (1 * GPT4O_MINI_COST_PER_1K_OUTPUT)
+        total = transcription_cost + analysis_cost
+
+        return {
+            'estimated_duration_sec': duration,
+            'transcription_cost': transcription_cost,
+            'analysis_cost': analysis_cost,
+            'total_cost': total,
+            'model': model,
+        }
+
+    # ── Transcription ─────────────────────────────────────────────────────────
+
     def transcribe_with_diarization(self, file_path: Path, model: str = "gpt-4o-transcribe-diarize") -> List[Dict]:
         """Transcribe audio with speaker diarization using OpenAI API."""
-        print(f"Transcribing audio with speaker diarization: {file_path.name}")
-        print(f"Using model: {model}")
-        
-        # Check file size (OpenAI limit is 25MB)
+        print(f"  Transcribing: {file_path.name}")
+        print(f"  Model: {model}")
+
         file_size_mb = file_path.stat().st_size / (1024 * 1024)
         if file_size_mb > 25:
             raise ValueError(
                 f"File size ({file_size_mb:.1f}MB) exceeds OpenAI's 25MB limit. "
-                "Please compress or split the audio file."
+                "Use --extract-audio to compress, or split the file."
             )
-        
+
         try:
             with open(file_path, 'rb') as audio_file:
-                # Try diarization-capable models
                 if model == "gpt-4o-transcribe-diarize":
                     transcript = self.client.audio.transcriptions.create(
                         model=model,
                         file=audio_file,
                         response_format="diarized_json",
-                        chunking_strategy="auto"
+                        chunking_strategy="auto",
                     )
                 else:
-                    # Fallback to regular transcription with verbose_json
                     transcript = self.client.audio.transcriptions.create(
                         model=model,
                         file=audio_file,
                         response_format="verbose_json",
-                        timestamp_granularities=["segment"]
+                        timestamp_granularities=["segment"],
                     )
-            
-            # Convert response to dict and extract segments
+
             transcript_dict = transcript.model_dump()
-            
-            # Handle different response formats
+
             if 'segments' in transcript_dict:
                 segments = transcript_dict['segments']
-                # Add speaker labels if not present (fallback behavior)
                 for i, seg in enumerate(segments):
                     if 'speaker' not in seg:
-                        seg['speaker'] = f"SPEAKER_{i % 2}"  # Simple alternating for demo
+                        seg['speaker'] = f"SPEAKER_{i % 2}"
             else:
-                # Fallback format
                 segments = [{
                     'speaker': 'Speaker 1',
                     'start': 0,
                     'end': 0,
-                    'text': transcript_dict.get('text', '')
+                    'text': transcript_dict.get('text', ''),
                 }]
-            
+
             return segments
-            
+
         except Exception as e:
             error_msg = str(e)
-            
-            # Check if it's a model access error
             if "model_not_found" in error_msg or "does not have access" in error_msg:
-                print(f"\n⚠️  Model '{model}' is not available for your account.")
-                print("Trying fallback model 'whisper-1'...\n")
-                
-                # Retry with whisper-1
+                print(f"\n  ⚠️  Model '{model}' is not available for your account.")
+                print("  Trying fallback model 'whisper-1'...\n")
                 if model != "whisper-1":
                     return self.transcribe_with_diarization(file_path, model="whisper-1")
-            
             raise RuntimeError(f"OpenAI API transcription failed: {e}")
-    
-    def format_timestamp(self, seconds: float) -> str:
-        """Format seconds to HH:MM:SS."""
+
+    # ── Cleaning ──────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def clean_transcript(text: str) -> str:
+        """Remove filler words and clean up whitespace."""
+        cleaned = _filler_pattern.sub('', text)
+        cleaned = re.sub(r' {2,}', ' ', cleaned)       # collapse double spaces
+        cleaned = re.sub(r' ([,.\?!])', r'\1', cleaned) # fix space before punctuation
+        return cleaned.strip()
+
+    # ── Formatting ────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def format_timestamp(seconds: float) -> str:
         hours = int(seconds // 3600)
         minutes = int((seconds % 3600) // 60)
         secs = int(seconds % 60)
         return f"{hours:02d}:{minutes:02d}:{secs:02d}"
-    
-    def format_transcript(self, segments: List[Dict]) -> str:
+
+    def format_transcript(self, segments: List[Dict], clean: bool = False) -> str:
         """Format segments into readable transcript."""
         output = []
-        
-        # Map speaker labels to simpler names
-        speaker_map = {}
+        speaker_map: Dict[str, str] = {}
         speaker_counter = 1
-        
+
         for segment in segments:
             speaker_id = segment.get('speaker', 'UNKNOWN')
-            
             if speaker_id not in speaker_map:
                 speaker_map[speaker_id] = f"Speaker {speaker_counter}"
                 speaker_counter += 1
-            
+
             speaker_name = speaker_map[speaker_id]
-            start_time = self.format_timestamp(segment.get('start', 0))
-            end_time = self.format_timestamp(segment.get('end', 0))
-            text = segment.get('text', '').strip()
-            
-            output.append(f"[{start_time} - {end_time}] {speaker_name}:")
+            start = self.format_timestamp(segment.get('start', 0))
+            end   = self.format_timestamp(segment.get('end', 0))
+            text  = segment.get('text', '').strip()
+            if clean:
+                text = self.clean_transcript(text)
+
+            output.append(f"[{start} - {end}] {speaker_name}:")
             output.append(f"{text}\n")
-        
+
         return '\n'.join(output)
-    
-    def save_transcript(self, transcript: str, original_file: Path) -> Path:
-        """Save transcript to text file."""
-        output_file = original_file.with_name(f"{original_file.stem}_transcript.txt")
-        
-        with open(output_file, 'w', encoding='utf-8') as f:
-            f.write(transcript)
-        
-        return output_file
-    
-    def generate_summary(self, transcript_text: str) -> str:
-        """Generate a brief topic summary using OpenAI."""
-        try:
-            response = self.client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {"role": "system", "content": "You are a helpful assistant that summarizes transcripts in one concise sentence."},
-                    {"role": "user", "content": f"Summarize this transcript in one sentence:\n\n{transcript_text[:1000]}"}
-                ],
-                max_tokens=50
-            )
-            return response.choices[0].message.content.strip()
-        except Exception:
-            return "Unable to generate summary"
-    
+
+    # ── Metadata ──────────────────────────────────────────────────────────────
+
     def get_metadata(self, segments: List[Dict]) -> Dict:
-        """Extract metadata from segments."""
         if not segments:
-            return {
-                'duration': 0,
-                'speaker_count': 0,
-                'speakers': []
-            }
-        
-        # Calculate duration
-        max_end = max(seg.get('end', 0) for seg in segments)
-        
-        # Count unique speakers
+            return {'duration': 0, 'speaker_count': 0, 'speakers': [], 'full_text': ''}
+
+        max_end  = max(seg.get('end', 0) for seg in segments)
         speakers = set(seg.get('speaker', 'UNKNOWN') for seg in segments)
-        
-        # Get full transcript text for summary
         full_text = ' '.join(seg.get('text', '') for seg in segments)
-        
+
         return {
             'duration': max_end,
             'speaker_count': len(speakers),
             'speakers': list(speakers),
-            'full_text': full_text
+            'full_text': full_text,
         }
-    
-    def format_duration(self, seconds: float) -> str:
-        """Format duration in human-readable format."""
+
+    @staticmethod
+    def format_duration(seconds: float) -> str:
         if seconds < 60:
             return f"~{int(seconds)} seconds"
         elif seconds < 3600:
-            minutes = int(seconds / 60)
-            return f"~{minutes} minute{'s' if minutes != 1 else ''}"
+            m = int(seconds / 60)
+            return f"~{m} minute{'s' if m != 1 else ''}"
         else:
-            hours = int(seconds / 3600)
-            minutes = int((seconds % 3600) / 60)
-            return f"~{hours} hour{'s' if hours != 1 else ''} {minutes} minute{'s' if minutes != 1 else ''}"
-    
-    def process_audio(self, file_path: Path, extract_audio: bool = False, model: str = "gpt-4o-transcribe-diarize") -> tuple[str, Path, Dict]:
-        """Main processing pipeline."""
-        # Validate input
+            h = int(seconds / 3600)
+            m = int((seconds % 3600) / 60)
+            return f"~{h} hour{'s' if h != 1 else ''} {m} minute{'s' if m != 1 else ''}"
+
+    # ── AI-powered analysis ───────────────────────────────────────────────────
+
+    def _chat(self, system: str, user: str, max_tokens: int = 800) -> tuple[str, int, int]:
+        """Helper: call gpt-4o-mini and return (text, input_tokens, output_tokens)."""
+        resp = self.client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            max_tokens=max_tokens,
+        )
+        choice = resp.choices[0].message.content.strip()
+        usage  = resp.usage
+        return choice, usage.prompt_tokens, usage.completion_tokens
+
+    def generate_summary(self, full_text: str) -> str:
+        """One-line topic summary."""
+        try:
+            text, inp, out = self._chat(
+                "You summarize transcripts in one concise sentence.",
+                f"Summarize:\n\n{full_text[:2000]}",
+                max_tokens=60,
+            )
+            self.cost.add_chat_tokens(inp, out)
+            return text
+        except Exception:
+            return "Unable to generate summary"
+
+    def generate_advanced_summary(self, full_text: str) -> str:
+        """Detailed analysis: key points, action items, decisions, Q&A."""
+        prompt = (
+            "Analyze the following transcript and produce a structured report with these sections:\n"
+            "## Key Points\n- bullet list of the main ideas discussed\n\n"
+            "## Action Items\n- bullet list of tasks, owners if mentioned, deadlines if mentioned\n\n"
+            "## Decisions Made\n- bullet list of any conclusions or agreements\n\n"
+            "## Questions Raised\n- bullet list of open or answered questions\n\n"
+            "## Overall Summary\n- 2-3 sentence high-level summary\n\n"
+            "If a section has no content, write 'None identified.'\n\n"
+            f"TRANSCRIPT:\n{full_text[:6000]}"
+        )
+        try:
+            text, inp, out = self._chat(
+                "You are a professional meeting analyst. Output clean Markdown.",
+                prompt,
+                max_tokens=1200,
+            )
+            self.cost.add_chat_tokens(inp, out)
+            return text
+        except Exception:
+            return "Unable to generate advanced summary"
+
+    def generate_content_analysis(self, full_text: str) -> str:
+        """Topics, keywords, named entities, sentiment."""
+        prompt = (
+            "Analyze this transcript and return a structured report:\n\n"
+            "## Topics Discussed\n- list each topic with a one-line description\n\n"
+            "## Keywords\n- comma-separated list of important terms\n\n"
+            "## Named Entities\n- People, Companies, Products, Locations mentioned\n\n"
+            "## Sentiment Overview\n- overall tone and per-speaker sentiment if multiple speakers\n\n"
+            "## Speaking Style\n- pace observations, formality level, notable patterns\n\n"
+            f"TRANSCRIPT:\n{full_text[:6000]}"
+        )
+        try:
+            text, inp, out = self._chat(
+                "You are a content analyst. Output clean Markdown.",
+                prompt,
+                max_tokens=1000,
+            )
+            self.cost.add_chat_tokens(inp, out)
+            return text
+        except Exception:
+            return "Unable to generate content analysis"
+
+    def generate_confidence_report(self, segments: List[Dict]) -> str:
+        """Heuristic confidence scoring based on segment characteristics."""
+        lines = []
+        total_score = 0
+        count = 0
+
+        for seg in segments:
+            text = seg.get('text', '').strip()
+            start = seg.get('start', 0)
+            end   = seg.get('end', 0)
+            duration = end - start
+
+            # Heuristic scoring
+            score = 100
+            reasons = []
+
+            # Very short segments with text → may be mis-split
+            if duration < 1 and len(text.split()) > 5:
+                score -= 15
+                reasons.append("high word density for short segment")
+
+            # Very long unbroken segment → may have missed speaker changes
+            if duration > 60:
+                score -= 10
+                reasons.append("long unbroken segment")
+
+            # Few words for long duration → possible silence / music
+            word_count = len(text.split())
+            if duration > 5 and word_count < 3:
+                score -= 20
+                reasons.append("sparse text for duration")
+
+            # Contains repeated words → possible stutter / loop
+            words = text.lower().split()
+            if len(words) > 3 and len(set(words)) < len(words) * 0.5:
+                score -= 15
+                reasons.append("high word repetition")
+
+            score = max(score, 0)
+            total_score += score
+            count += 1
+
+            if score < 85:
+                ts = self.format_timestamp(start)
+                lines.append(f"  [{ts}] Score: {score}/100 — {', '.join(reasons)}")
+
+        avg = total_score / count if count else 0
+        header = f"Overall Confidence: {avg:.0f}/100  ({count} segments analyzed)\n"
+
+        if lines:
+            header += f"\nLow-confidence segments ({len(lines)}):\n"
+            header += '\n'.join(lines)
+        else:
+            header += "\nAll segments scored 85+ — no concerns detected."
+
+        return header
+
+    # ── Save helpers ──────────────────────────────────────────────────────────
+
+    def save_transcript(self, transcript: str, original_file: Path) -> Path:
+        output_file = original_file.with_name(f"{original_file.stem}_transcript.txt")
+        output_file.write_text(transcript, encoding='utf-8')
+        return output_file
+
+    def save_analysis(self, original_file: Path, advanced_summary: str,
+                      content_analysis: str, confidence: str, cost_summary: str) -> Path:
+        """Save advanced analysis to a separate _analysis.txt file."""
+        output_file = original_file.with_name(f"{original_file.stem}_analysis.txt")
+        sections = [
+            "=" * 80,
+            "ADVANCED ANALYSIS REPORT",
+            f"Source: {original_file.name}",
+            "=" * 80,
+            "",
+            "─── DETAILED SUMMARY ───",
+            advanced_summary,
+            "",
+            "─── CONTENT ANALYSIS ───",
+            content_analysis,
+            "",
+            "─── CONFIDENCE REPORT ───",
+            confidence,
+            "",
+            "─── COST ESTIMATE ───",
+            cost_summary,
+        ]
+        output_file.write_text('\n'.join(sections), encoding='utf-8')
+        return output_file
+
+    # ── Main pipeline ─────────────────────────────────────────────────────────
+
+    def process_audio(
+        self,
+        file_path: Path,
+        extract_audio: bool = False,
+        model: str = "gpt-4o-transcribe-diarize",
+        clean: bool = False,
+        analyze: bool = True,
+    ) -> Dict:
+        """Full processing pipeline. Returns a result dict."""
         self.validate_file(file_path)
-        
-        # Check if we need to extract audio from video
+
         suffix = file_path.suffix.lower()
         extracted_audio_path = None
-        
+
         if suffix in self.SUPPORTED_VIDEO_FORMATS or extract_audio:
             extracted_audio_path = self.extract_audio_from_video(file_path)
             processing_file = extracted_audio_path
         else:
             processing_file = file_path
-        
+
         try:
-            # Perform transcription with speaker diarization
+            # Transcribe
             segments = self.transcribe_with_diarization(processing_file, model=model)
-            
-            # Get metadata
             metadata = self.get_metadata(segments)
-            
-            # Generate topic summary
-            print("\nGenerating topic summary...")
-            metadata['topic'] = self.generate_summary(metadata['full_text'])
-            
-            # Format transcript
-            formatted_transcript = self.format_transcript(segments)
-            
-            # Save to file (use original filename)
-            output_file = self.save_transcript(formatted_transcript, file_path)
-            metadata['output_file'] = output_file
-            
-            return formatted_transcript, output_file, metadata
-            
+
+            # Track transcription cost
+            self.cost.add_transcription(metadata['duration'], model)
+
+            # Format
+            formatted = self.format_transcript(segments, clean=clean)
+            transcript_file = self.save_transcript(formatted, file_path)
+
+            # One-line topic
+            print("  Generating topic summary...")
+            topic = self.generate_summary(metadata['full_text'])
+
+            # Advanced analysis
+            advanced_summary = ""
+            content_analysis = ""
+            confidence = ""
+            analysis_file = None
+
+            if analyze:
+                print("  Generating advanced summary...")
+                advanced_summary = self.generate_advanced_summary(metadata['full_text'])
+
+                print("  Generating content analysis...")
+                content_analysis = self.generate_content_analysis(metadata['full_text'])
+
+                print("  Calculating confidence scores...")
+                confidence = self.generate_confidence_report(segments)
+
+                analysis_file = self.save_analysis(
+                    file_path, advanced_summary, content_analysis,
+                    confidence, self.cost.summary(),
+                )
+
+            return {
+                'file': file_path,
+                'transcript': formatted,
+                'transcript_file': transcript_file,
+                'analysis_file': analysis_file,
+                'segments': segments,
+                'metadata': metadata,
+                'topic': topic,
+                'advanced_summary': advanced_summary,
+                'content_analysis': content_analysis,
+                'confidence': confidence,
+            }
+
         finally:
-            # Clean up extracted audio file
             if extracted_audio_path and extracted_audio_path.exists():
                 try:
                     extracted_audio_path.unlink()
-                    print(f"Cleaned up temporary file: {extracted_audio_path.name}")
                 except Exception:
                     pass
 
 
-def main():
-    """Main entry point."""
-    parser = argparse.ArgumentParser(
-        description='Transcribe audio/video with speaker diarization using OpenAI API'
-    )
-    parser.add_argument(
-        'file',
-        type=str,
-        help='Path to audio/video file (wav, mp3, m4a, flac, ogg, mp4, mpeg, mpga, webm, avi, mov, mkv)'
-    )
-    parser.add_argument(
-        '--api-key',
-        type=str,
-        help='OpenAI API key (or set OPENAI_API_KEY env variable)'
-    )
-    parser.add_argument(
-        '--extract-audio',
-        action='store_true',
-        help='Force audio extraction from video (useful for large MP4 files)'
-    )
-    parser.add_argument(
-        '--model',
-        type=str,
-        default='gpt-4o-transcribe-diarize',
-        choices=['gpt-4o-transcribe-diarize', 'gpt-4o-transcribe', 'gpt-4o-mini-transcribe', 'whisper-1'],
-        help='OpenAI model to use (default: gpt-4o-transcribe-diarize)'
-    )
-    
-    args = parser.parse_args()
-    
-    try:
-        # Initialize transcriber
-        transcriber = AudioTranscriber(api_key=args.api_key)
-        
-        # Process audio/video file
-        file_path = Path(args.file)
-        transcript, output_file, metadata = transcriber.process_audio(
-            file_path, 
-            extract_audio=args.extract_audio,
-            model=args.model
-        )
-        
-        # Print metadata
-        print("\n" + "="*80)
-        print("TRANSCRIPTION SUMMARY")
-        print("="*80)
-        print(f"Duration: {transcriber.format_duration(metadata['duration'])}")
-        
-        speaker_count = metadata['speaker_count']
-        if speaker_count == 1:
-            print(f"Speakers: 1 speaker detected")
+# ══════════════════════════════════════════════════════════════════════════════
+# Console output helpers
+# ══════════════════════════════════════════════════════════════════════════════
+
+def print_result(transcriber: AudioTranscriber, result: Dict):
+    """Pretty-print a single transcription result."""
+    meta = result['metadata']
+
+    print("\n" + "=" * 80)
+    print("TRANSCRIPTION SUMMARY")
+    print("=" * 80)
+    print(f"  File:      {result['file'].name}")
+    print(f"  Duration:  {transcriber.format_duration(meta['duration'])}")
+    sc = meta['speaker_count']
+    print(f"  Speakers:  {sc} speaker{'s' if sc != 1 else ''} detected")
+    print(f"  Topic:     {result['topic']}")
+    print(f"  Cost:      {transcriber.cost.summary()}")
+
+    if result.get('confidence'):
+        print(f"\n{'─' * 80}")
+        print("CONFIDENCE REPORT")
+        print(f"{'─' * 80}")
+        print(result['confidence'])
+
+    print(f"\n{'─' * 80}")
+    print("FULL TRANSCRIPT")
+    print(f"{'─' * 80}\n")
+    print(result['transcript'])
+
+    if result.get('advanced_summary'):
+        print(f"{'─' * 80}")
+        print("ADVANCED SUMMARY")
+        print(f"{'─' * 80}")
+        print(result['advanced_summary'])
+
+    if result.get('content_analysis'):
+        print(f"\n{'─' * 80}")
+        print("CONTENT ANALYSIS")
+        print(f"{'─' * 80}")
+        print(result['content_analysis'])
+
+    print("=" * 80)
+    print(f"\nTranscript saved to:   {result['transcript_file']}")
+    if result.get('analysis_file'):
+        print(f"Analysis saved to:     {result['analysis_file']}")
+
+
+def print_batch_summary(transcriber: AudioTranscriber, results: List[Dict]):
+    """Print summary table for batch processing."""
+    print("\n" + "=" * 80)
+    print("BATCH PROCESSING COMPLETE")
+    print("=" * 80)
+    print(f"  Files processed: {len(results)}")
+    print(f"  Total cost:      {transcriber.cost.summary()}")
+    print()
+
+    for i, r in enumerate(results, 1):
+        meta = r['metadata']
+        print(f"  {i}. {r['file'].name}")
+        print(f"     Duration: {transcriber.format_duration(meta['duration'])}  |  "
+              f"Speakers: {meta['speaker_count']}  |  Topic: {r['topic'][:60]}")
+        print(f"     → {r['transcript_file']}")
+        if r.get('analysis_file'):
+            print(f"     → {r['analysis_file']}")
+        print()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Interactive mode
+# ══════════════════════════════════════════════════════════════════════════════
+
+def interactive_mode(transcriber: AudioTranscriber, model: str):
+    """Interactive REPL for processing files."""
+    print("\n" + "=" * 80)
+    print("  INTERACTIVE TRANSCRIPTION MODE")
+    print("  Type a file/folder path, or a command below.")
+    print("  Commands: help, cost, quit")
+    print("=" * 80 + "\n")
+
+    clean = False
+    analyze = True
+    extract = False
+
+    while True:
+        try:
+            user_input = input("transcribe> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nGoodbye!")
+            break
+
+        if not user_input:
+            continue
+
+        cmd = user_input.lower()
+
+        if cmd in ('quit', 'exit', 'q'):
+            print("Goodbye!")
+            break
+
+        elif cmd == 'help':
+            print("""
+  Commands:
+    <file_path>         Transcribe a single file
+    <folder_path>       Batch-transcribe all audio/video files in folder
+    clean on/off        Toggle filler-word removal (current: {})
+    analyze on/off      Toggle advanced analysis (current: {})
+    extract on/off      Toggle force audio extraction (current: {})
+    cost                Show total session cost so far
+    help                Show this help
+    quit                Exit interactive mode
+""".format('ON' if clean else 'OFF', 'ON' if analyze else 'OFF', 'ON' if extract else 'OFF'))
+
+        elif cmd == 'cost':
+            print(f"  Session cost: {transcriber.cost.summary()}\n")
+
+        elif cmd.startswith('clean '):
+            val = cmd.split()[1]
+            clean = val in ('on', 'true', '1', 'yes')
+            print(f"  Filler-word cleaning: {'ON' if clean else 'OFF'}\n")
+
+        elif cmd.startswith('analyze '):
+            val = cmd.split()[1]
+            analyze = val in ('on', 'true', '1', 'yes')
+            print(f"  Advanced analysis: {'ON' if analyze else 'OFF'}\n")
+
+        elif cmd.startswith('extract '):
+            val = cmd.split()[1]
+            extract = val in ('on', 'true', '1', 'yes')
+            print(f"  Force audio extraction: {'ON' if extract else 'OFF'}\n")
+
         else:
-            print(f"Speakers: {speaker_count} speakers detected")
-        
-        print(f"Topic: {metadata['topic']}")
-        print(f"Output file: {output_file.name}")
-        
-        # Print full transcript
-        print("\n" + "="*80)
-        print("FULL TRANSCRIPT")
-        print("="*80 + "\n")
-        print(transcript)
-        print("="*80)
-        print(f"\nTranscript saved to: {output_file}")
-        
+            path = Path(user_input.strip('"').strip("'"))
+
+            if path.is_dir():
+                # Batch process
+                results = batch_process(
+                    transcriber, path, model=model,
+                    clean=clean, analyze=analyze, extract_audio=extract,
+                )
+                if results:
+                    print_batch_summary(transcriber, results)
+                else:
+                    print("  No supported files found in directory.\n")
+
+            elif path.is_file():
+                try:
+                    result = transcriber.process_audio(
+                        path, extract_audio=extract, model=model,
+                        clean=clean, analyze=analyze,
+                    )
+                    print_result(transcriber, result)
+                except Exception as e:
+                    print(f"  Error: {e}\n")
+            else:
+                print(f"  Path not found: {path}\n")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Batch processing
+# ══════════════════════════════════════════════════════════════════════════════
+
+def batch_process(
+    transcriber: AudioTranscriber,
+    folder: Path,
+    model: str,
+    clean: bool = False,
+    analyze: bool = True,
+    extract_audio: bool = False,
+) -> List[Dict]:
+    """Process all supported audio/video files in a folder."""
+    all_formats = transcriber.SUPPORTED_AUDIO_FORMATS | transcriber.SUPPORTED_VIDEO_FORMATS
+    files = sorted(
+        f for f in folder.iterdir()
+        if f.is_file() and f.suffix.lower() in all_formats
+    )
+
+    if not files:
+        return []
+
+    print(f"\n  Found {len(files)} file(s) in {folder}\n")
+
+    results = []
+    for i, file_path in enumerate(files, 1):
+        print(f"\n[{i}/{len(files)}] Processing: {file_path.name}")
+        print("-" * 60)
+        try:
+            result = transcriber.process_audio(
+                file_path, extract_audio=extract_audio,
+                model=model, clean=clean, analyze=analyze,
+            )
+            results.append(result)
+            print(f"  ✓ Done — {result['topic'][:60]}")
+        except Exception as e:
+            print(f"  ✗ Failed: {e}")
+
+    return results
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CLI entry point
+# ══════════════════════════════════════════════════════════════════════════════
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Transcribe audio/video with speaker diarization, analysis & more',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+examples:
+  python transcribe.py meeting.mp4
+  python transcribe.py meeting.mp4 --clean
+  python transcribe.py ./recordings/ --batch
+  python transcribe.py --interactive
+  python transcribe.py meeting.mp4 --no-analysis
+  python transcribe.py meeting.mp4 --estimate-cost
+        """,
+    )
+    parser.add_argument(
+        'file', nargs='?', type=str, default=None,
+        help='Path to audio/video file, or folder (with --batch)',
+    )
+    parser.add_argument('--api-key', type=str, help='OpenAI API key')
+    parser.add_argument(
+        '--model', type=str, default='gpt-4o-transcribe-diarize',
+        choices=['gpt-4o-transcribe-diarize', 'gpt-4o-transcribe', 'gpt-4o-mini-transcribe', 'whisper-1'],
+        help='Transcription model (default: gpt-4o-transcribe-diarize)',
+    )
+    parser.add_argument('--extract-audio', action='store_true',
+                        help='Force audio extraction from video')
+    parser.add_argument('--clean', action='store_true',
+                        help='Remove filler words (um, uh, like, you know, etc.)')
+    parser.add_argument('--no-analysis', action='store_true',
+                        help='Skip advanced summary and content analysis')
+    parser.add_argument('--batch', action='store_true',
+                        help='Process all supported files in a folder')
+    parser.add_argument('--interactive', '-i', action='store_true',
+                        help='Launch interactive mode')
+    parser.add_argument('--estimate-cost', action='store_true',
+                        help='Show estimated cost without processing')
+
+    args = parser.parse_args()
+
+    try:
+        transcriber = AudioTranscriber(api_key=args.api_key)
+
+        # Interactive mode
+        if args.interactive:
+            interactive_mode(transcriber, model=args.model)
+            return
+
+        if not args.file:
+            parser.print_help()
+            sys.exit(1)
+
+        file_path = Path(args.file)
+        analyze = not args.no_analysis
+
+        # Cost estimation only
+        if args.estimate_cost:
+            if file_path.is_dir():
+                all_fmts = transcriber.SUPPORTED_AUDIO_FORMATS | transcriber.SUPPORTED_VIDEO_FORMATS
+                files = [f for f in file_path.iterdir() if f.suffix.lower() in all_fmts]
+            else:
+                files = [file_path]
+
+            total = 0
+            print("\nCost Estimate:")
+            print("-" * 50)
+            for f in files:
+                est = transcriber.estimate_cost(f, args.model)
+                print(f"  {f.name}: ~${est['total_cost']:.4f} "
+                      f"(~{est['estimated_duration_sec']:.0f}s, {args.model})")
+                total += est['total_cost']
+            print("-" * 50)
+            print(f"  Estimated total: ~${total:.4f}\n")
+            return
+
+        # Batch mode
+        if args.batch or file_path.is_dir():
+            if not file_path.is_dir():
+                print(f"Error: {file_path} is not a directory.", file=sys.stderr)
+                sys.exit(1)
+
+            results = batch_process(
+                transcriber, file_path, model=args.model,
+                clean=args.clean, analyze=analyze,
+                extract_audio=args.extract_audio,
+            )
+            if results:
+                print_batch_summary(transcriber, results)
+            else:
+                print("No supported files found in the directory.")
+            return
+
+        # Single file
+        result = transcriber.process_audio(
+            file_path, extract_audio=args.extract_audio,
+            model=args.model, clean=args.clean, analyze=analyze,
+        )
+        print_result(transcriber, result)
+
     except KeyboardInterrupt:
-        print("\n\nOperation cancelled by user.")
+        print("\n\nOperation cancelled.")
         sys.exit(1)
     except Exception as e:
         print(f"\nError: {e}", file=sys.stderr)

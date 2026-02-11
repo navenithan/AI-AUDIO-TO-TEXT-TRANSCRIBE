@@ -1,13 +1,11 @@
 # Audio Transcription with Speaker Diarization
 
-Production-ready speech-to-text tool with speaker identification using OpenAI's native diarization.
-**Now supports video files** with automatic audio extraction!
+Production-ready speech-to-text tool with speaker identification, content analysis, and batch processing — powered entirely by OpenAI.
 
 ## Quick Setup
 
 ### 1. Install Python 3.10+
 
-Ensure Python 3.10 or newer is installed:
 ```bash
 python --version
 ```
@@ -18,7 +16,7 @@ python --version
 python -m venv venv
 ```
 
-Activate the virtual environment:
+Activate:
 - **Windows**: `venv\Scripts\activate`
 - **Linux/Mac**: `source venv/bin/activate`
 
@@ -30,82 +28,97 @@ pip install -r requirements.txt
 
 ### 4. Configure API Key
 
-1. Get your OpenAI API key from [OpenAI Platform](https://platform.openai.com/api-keys)
+Create a `.env` file (or set the variable directly):
+```bash
+# .env file
+OPENAI_API_KEY=your_key_here
+```
 
-2. Set environment variable:
-   ```bash
-   # Windows (PowerShell)
-   $env:OPENAI_API_KEY="your_key_here"
-   
-   # Linux/Mac
-   export OPENAI_API_KEY="your_key_here"
-   ```
+Or set via terminal:
+```bash
+# Windows (PowerShell)
+$env:OPENAI_API_KEY="your_key_here"
+
+# Linux/Mac
+export OPENAI_API_KEY="your_key_here"
+```
 
 ## Usage
 
+### Single File
 ```bash
-# Transcribe audio file
-python transcribe.py audio.mp3
-
-# Transcribe video file (auto-extracts audio)
 python transcribe.py meeting.mp4
-
-# Force audio extraction for large video files
-python transcribe.py large_video.mp4 --extract-audio
+python transcribe.py interview.mp3 --clean
+python transcribe.py call.wav --no-analysis
 ```
 
-### Supported Formats
-
-**Audio (native support):**
-- WAV, MP3, M4A, FLAC, OGG
-- MP4, MPEG, MPGA, WEBM
-
-**Video (auto audio extraction):**
-- AVI, MOV, MKV, WMV, FLV
-
-### Command-Line Options
-
+### Batch Processing (entire folder)
 ```bash
-# Basic usage
-python transcribe.py file.mp3
+python transcribe.py ./recordings/ --batch
+python transcribe.py ./recordings/ --batch --clean
+```
 
-# Provide API key directly
-python transcribe.py file.wav --api-key YOUR_OPENAI_KEY
+### Interactive Mode
+```bash
+python transcribe.py --interactive
+```
 
-# Extract audio from video first (helps with large files)
-python transcribe.py video.mp4 --extract-audio
+### Cost Estimation (before processing)
+```bash
+python transcribe.py meeting.mp4 --estimate-cost
+python transcribe.py ./recordings/ --estimate-cost
+```
+
+### All CLI Options
+```
+python transcribe.py <file_or_folder> [options]
+
+Options:
+  --model MODEL          Transcription model (default: gpt-4o-transcribe-diarize)
+  --clean                Remove filler words (um, uh, like, you know, etc.)
+  --no-analysis          Skip advanced summary and content analysis
+  --batch                Process all supported files in a folder
+  --interactive, -i      Launch interactive mode
+  --extract-audio        Force audio extraction from video
+  --estimate-cost        Show estimated cost without processing
+  --api-key KEY          OpenAI API key (overrides env variable)
 ```
 
 ## Features
 
-✅ **Single API Platform** - Uses only OpenAI (no HuggingFace needed)  
-✅ **Video Support** - Automatically extracts audio from video files  
-✅ **Speaker Diarization** - Identifies different speakers automatically  
-✅ **Timestamp Precision** - HH:MM:SS format for each segment  
-✅ **Multiple Formats** - Supports 15+ audio/video formats  
-✅ **25MB Limit Check** - Warns if file exceeds OpenAI's limit  
-✅ **Clean Output** - Console display + text file output  
-✅ **Auto Cleanup** - Removes temporary extracted audio files
+### Core
+- **Speaker Diarization** — Identifies different speakers automatically
+- **15+ Formats** — WAV, MP3, M4A, FLAC, OGG, MP4, MPEG, WEBM, AVI, MOV, MKV, WMV, FLV
+- **Video Support** — Auto-extracts audio from video files
+- **Timestamps** — HH:MM:SS for each speaker segment
 
-## How Video Extraction Works
+### Analysis (saved to `<filename>_analysis.txt`)
+- **Advanced Summary** — Key points, action items, decisions, Q&A
+- **Content Analysis** — Topics, keywords, named entities, sentiment
+- **Confidence Scores** — Heuristic quality check per segment
 
-For video files (AVI, MOV, MKV, etc.), the script:
-1. Extracts audio track to temporary MP3 file using MoviePy
-2. Sends audio to OpenAI for transcription with speaker diarization
-3. Generates formatted transcript
-4. Cleans up the temporary file automatically
+### Processing
+- **Batch Mode** — Process entire folders of files
+- **Smart Cleaning** — Remove filler words (um, uh, like, you know, etc.)
+- **Cost Estimation** — See estimated API cost before committing
+- **Cost Tracking** — Running total of actual API spend
 
-**Note**: MP4/MPEG can be sent directly to OpenAI, but use `--extract-audio` if the file is large (>25MB) or if you encounter issues.
+### Interactive Mode
+- REPL-style interface for processing files one-by-one
+- Toggle cleaning, analysis, extraction on/off
+- View running session cost
+- Process files or entire folders
 
-## Output
+## Output Files
 
-The script generates two outputs:
+Each file produces:
 
-1. **Console**: Pretty-printed transcript
-2. **File**: `<filename>_transcript.txt` in the same directory as the input file
+| File | Content |
+|------|---------|
+| `<name>_transcript.txt` | Timestamped speaker transcript |
+| `<name>_analysis.txt` | Summary, content analysis, confidence report, cost |
 
-### Output Format Example
-
+### Transcript Format
 ```
 [00:00:01 - 00:00:08] Speaker 1:
 Good morning everyone. Let's get started with the sprint review.
@@ -114,31 +127,34 @@ Good morning everyone. Let's get started with the sprint review.
 Sure. First item is the payment module refactor.
 ```
 
-## Error Handling
+### Analysis Report Includes
+- Detailed Summary (key points, action items, decisions, questions)
+- Content Analysis (topics, keywords, entities, sentiment)
+- Confidence Report (per-segment quality scoring)
+- Cost Breakdown (transcription + analysis costs)
 
-The script handles:
+## Supported Formats
+
+**Audio (native OpenAI support):**
+WAV, MP3, M4A, FLAC, OGG, MP4, MPEG, MPGA, WEBM
+
+**Video (auto audio extraction):**
+AVI, MOV, MKV, WMV, FLV
 
 ## Requirements
 
 - Python 3.10+
-- OpenAI API key (paid account required for API access)
+- OpenAI API key (paid account)
+- FFmpeg (for video audio extraction via MoviePy)
 
 ## Troubleshooting
 
-**"Missing required package" error**:
-```bash
-pip install -r requirements.txt
-```
+**"Missing required package"** — Run `pip install -r requirements.txt`
 
-**"API key not found" error**:
-Ensure the OPENAI_API_KEY environment variable is set correctly.
+**"API key not found"** — Ensure `.env` file exists or env variable is set
 
-**"API transcription failed" error**:
-1. Verify your OpenAI API key is valid
-2. Check your account has available credits
-3. Ensure the audio file is less than 25 MB
-4. Check internet connection
-3. Check internet connection
+**"Model not available"** — The script auto-falls back to `whisper-1`. Check your OpenAI account model access.
 
-**Audio conversion error**:
-Install FFmpeg and ensure it's in your system PATH.
+**"File size exceeds 25MB"** — Use `--extract-audio` to compress, or split the file
+
+**Audio extraction fails** — Install FFmpeg and ensure it's in your system PATH
