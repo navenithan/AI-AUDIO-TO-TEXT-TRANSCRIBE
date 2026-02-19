@@ -23,9 +23,37 @@ python transcribe.py conference_call.mp4
 python transcribe.py recording.mov
 python transcribe.py webinar.avi
 
-# Force extraction for large MP4 (>25MB)
+# Re-encode & compress for large MP4 (>25MB)
 python transcribe.py large_meeting.mp4 --extract-audio
 ```
+
+## Large / Long File Handling
+
+```bash
+# Large audio files (>25MB) — re-encodes and auto-splits into chunks
+python transcribe.py long_interview.m4a --extract-audio
+
+# Multi-hour recordings — auto-split to stay within API limits
+python transcribe.py 3hr_meeting.m4a --extract-audio --clean
+
+# Batch folder with large files
+python transcribe.py ./recordings/ --batch --extract-audio
+```
+
+### Auto-Split Output:
+```
+  Re-encoding audio: 3hr_meeting.m4a
+  Audio extracted to: 3hr_meeting.extracted.mp3 (87.3MB)
+  File is 87.3MB, 5720s -- splitting into 5 chunks (~1144s each)
+  Created 5 chunk(s)
+  -- Chunk 1/5 --
+  Transcribing: 3hr_meeting.extracted.chunk000.mp3
+  Model: gpt-4o-transcribe-diarize
+  File size: 17.5MB
+  -- Chunk 2/5 --
+  ...
+```
+Chunks are transcribed individually and merged with continuous timestamps.
 
 ## Expected Output
 
@@ -64,7 +92,7 @@ python transcribe.py zoom_recording.mp4
 
 ### Large Video Files (> 25MB)
 ```bash
-# Extract audio first to avoid size limit errors
+# Re-encode audio to compress; auto-splits if still over 25MB
 python transcribe.py long_webinar.mp4 --extract-audio
 ```
 
@@ -81,9 +109,9 @@ python transcribe.py gameplay.mkv
 ### File Size Error:
 ```
 Error: File size (30.5MB) exceeds OpenAI's 25MB limit.
-Please compress or split the audio file.
+Use --extract-audio to compress, or split the file.
 ```
-**Solution**: Use `--extract-audio` with compression or split the file.
+**Solution**: Use `--extract-audio` to re-encode and compress. The script will auto-split into chunks if needed.
 
 ### Missing API Key:
 ```
@@ -101,7 +129,8 @@ Supported formats: .wav, .mp3, .m4a, ...
 ## Tips
 
 1. **For meetings/conferences**: Use MP4/MP3 format for best compatibility
-2. **For large files**: Always use `--extract-audio` to compress before sending
+2. **For large files**: Always use `--extract-audio` — the script re-encodes to 128kbps mono MP3 and auto-splits into chunks if needed
 3. **For best accuracy**: Ensure clear audio with minimal background noise
 4. **For podcasts**: MP3 format works great and is smaller than WAV
 5. **For video files**: The script extracts only the audio track, video content is not analyzed
+6. **For multi-hour recordings**: `--extract-audio` is required — the API has a 25MB / 23-minute limit per request

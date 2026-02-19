@@ -79,7 +79,7 @@ Options:
   --no-analysis          Skip advanced summary and content analysis
   --batch                Process all supported files in a folder
   --interactive, -i      Launch interactive mode
-  --extract-audio        Force audio extraction from video
+  --extract-audio        Re-encode & compress audio (required for large/long files)
   --estimate-cost        Show estimated cost without processing
   --api-key KEY          OpenAI API key (overrides env variable)
 ```
@@ -99,6 +99,7 @@ Options:
 
 ### Processing
 - **Batch Mode** — Process entire folders of files
+- **Auto-Split** — Files over 25MB or 23 min are automatically split into chunks and merged
 - **Smart Cleaning** — Remove filler words (um, uh, like, you know, etc.)
 - **Cost Estimation** — See estimated API cost before committing
 - **Cost Tracking** — Running total of actual API spend
@@ -145,7 +146,7 @@ AVI, MOV, MKV, WMV, FLV
 
 - Python 3.10+
 - OpenAI API key (paid account)
-- FFmpeg (for video audio extraction via MoviePy)
+- FFmpeg (bundled via `imageio-ffmpeg`, or install system-wide)
 
 ## Troubleshooting
 
@@ -155,6 +156,6 @@ AVI, MOV, MKV, WMV, FLV
 
 **"Model not available"** — The script auto-falls back to `whisper-1`. Check your OpenAI account model access.
 
-**"File size exceeds 25MB"** — Use `--extract-audio` to compress, or split the file
+**"File size exceeds 25MB"** — Use `--extract-audio` to re-encode and compress; the script will auto-split into chunks if still needed
 
-**Audio extraction fails** — Install FFmpeg and ensure it's in your system PATH
+**Audio extraction fails** — Ensure `imageio-ffmpeg` is installed (`pip install imageio-ffmpeg`), or install FFmpeg system-wide
