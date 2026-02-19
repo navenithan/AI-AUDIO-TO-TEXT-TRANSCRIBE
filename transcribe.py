@@ -123,26 +123,176 @@ class AudioTranscriber:
             )
 
     def extract_audio_from_video(self, video_path: Path) -> Path:
-        """Extract audio from video file to MP3 format."""
-        try:
-            from moviepy.editor import VideoFileClip
-        except ImportError:
+        """Extract/re-encode audio to compressed MP3 using ffmpeg.
+
+        Works for both video files (extracts audio track) and oversized
+        audio files (re-encodes with compression to fit under 25 MB).
+        """
+        import subprocess
+
+        ffmpeg_cmd = self._find_ffmpeg()
+        if ffmpeg_cmd is None:
             raise ImportError(
-                "moviepy is required for video audio extraction. "
-                "Install it with: pip install moviepy"
+                "ffmpeg is required for audio extraction/compression. "
+                "Install it with: pip install imageio-ffmpeg  (or install ffmpeg on your system)"
             )
 
-        print(f"  Extracting audio from video: {video_path.name}")
+        print(f"  Re-encoding audio: {video_path.name}")
 
         try:
             audio_path = video_path.with_suffix('.extracted.mp3')
-            video = VideoFileClip(str(video_path))
-            video.audio.write_audiofile(str(audio_path), logger=None)
-            video.close()
-            print(f"  Audio extracted to: {audio_path.name}")
+            cmd = [
+                ffmpeg_cmd, '-y', '-i', str(video_path),
+                '-vn',                   # discard video
+                '-acodec', 'libmp3lame', # MP3 codec
+                '-ab', '128k',           # 128 kbps – good quality for speech
+                '-ar', '44100',          # 44.1 kHz sample rate
+                '-ac', '1',              # mono (halves size, fine for speech)
+                str(audio_path),
+            ]
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=600,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(result.stderr[-500:] if result.stderr else 'unknown ffmpeg error')
+
+            out_size_mb = audio_path.stat().st_size / (1024 * 1024)
+            print(f"  Audio extracted to: {audio_path.name} ({out_size_mb:.1f}MB)")
             return audio_path
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("ffmpeg timed out while processing the file.")
+        except RuntimeError:
+            raise
         except Exception as e:
-            raise RuntimeError(f"Failed to extract audio from video: {e}")
+            raise RuntimeError(f"Failed to extract audio: {e}")
+
+    @staticmethod
+    def _find_ffmpeg() -> Optional[str]:
+        """Return path to an ffmpeg binary, or None."""
+        import shutil
+        # 1. System ffmpeg
+        path = shutil.which('ffmpeg')
+        if path:
+            return path
+        # 2. imageio-ffmpeg bundled binary
+        try:
+            import imageio_ffmpeg
+            return imageio_ffmpeg.get_ffmpeg_exe()
+        except Exception:
+            pass
+        return None
+
+    def _get_duration(self, audio_path: Path) -> float:
+        """Get audio duration in seconds using ffprobe, ffmpeg, or mutagen."""
+        import subprocess, shutil
+
+        ffmpeg_cmd = self._find_ffmpeg()
+
+        # 1. Try mutagen (works for m4a, mp3, ogg, flac, etc.)
+        try:
+            from mutagen import File as MutagenFile
+            audio_info = MutagenFile(str(audio_path))
+            if audio_info and audio_info.info and audio_info.info.length > 0:
+                return audio_info.info.length
+        except Exception:
+            pass
+
+        if not ffmpeg_cmd:
+            return 0.0
+
+        # 2. Try ffprobe (same directory as ffmpeg)
+        ffprobe_cmd = shutil.which('ffprobe')
+        if not ffprobe_cmd:
+            ffprobe_candidate = str(Path(ffmpeg_cmd).with_name('ffprobe'))
+            if Path(ffprobe_candidate).exists():
+                ffprobe_cmd = ffprobe_candidate
+            elif Path(ffprobe_candidate + '.exe').exists():
+                ffprobe_cmd = ffprobe_candidate + '.exe'
+
+        if ffprobe_cmd:
+            try:
+                result = subprocess.run(
+                    [ffprobe_cmd, '-v', 'error', '-show_entries',
+                     'format=duration', '-of', 'csv=p=0', str(audio_path)],
+                    capture_output=True, text=True, timeout=30,
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    return float(result.stdout.strip())
+            except Exception:
+                pass
+
+        # 3. Use ffmpeg -i to parse duration from stderr
+        try:
+            result = subprocess.run(
+                [ffmpeg_cmd, '-i', str(audio_path), '-f', 'null', '-'],
+                capture_output=True, text=True, timeout=60,
+            )
+            # ffmpeg prints "Duration: HH:MM:SS.xx" in stderr
+            import re as _re
+            m = _re.search(r'Duration:\s*(\d+):(\d+):(\d+)\.(\d+)', result.stderr)
+            if m:
+                h, mn, s, cs = int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))
+                return h * 3600 + mn * 60 + s + cs / 100.0
+        except Exception:
+            pass
+
+        return 0.0
+
+    def _split_audio(self, audio_path: Path, max_size_mb: float = 24.0,
+                     max_duration_sec: float = 1300.0):
+        """Split an audio file into chunks that each fit under max_size_mb
+        and max_duration_sec.
+
+        Returns (chunk_paths, chunk_duration_sec).  chunk_duration_sec is
+        the target length of each chunk (0 when no split was needed).
+        """
+        import subprocess, math
+
+        file_size_mb = audio_path.stat().st_size / (1024 * 1024)
+        duration = self._get_duration(audio_path)
+
+        # Check if splitting is needed at all
+        if file_size_mb <= max_size_mb and (duration <= 0 or duration <= max_duration_sec):
+            return [audio_path], 0
+
+        ffmpeg_cmd = self._find_ffmpeg()
+        if not ffmpeg_cmd:
+            raise RuntimeError("ffmpeg is needed to split large files.")
+
+        if duration <= 0:
+            raise RuntimeError("Could not determine audio duration for splitting.")
+
+        # Determine chunk duration based on BOTH constraints
+        chunks_by_size = math.ceil(file_size_mb / max_size_mb) if file_size_mb > max_size_mb else 1
+        chunks_by_duration = math.ceil(duration / max_duration_sec) if duration > max_duration_sec else 1
+        num_chunks = max(chunks_by_size, chunks_by_duration)
+        chunk_duration = math.ceil(duration / num_chunks)
+
+        print(f"  File is {file_size_mb:.1f}MB, {duration:.0f}s "
+              f"-- splitting into {num_chunks} chunks (~{chunk_duration}s each)")
+
+        chunk_paths: List[Path] = []
+        for i in range(num_chunks):
+            start = i * chunk_duration
+            if start >= duration:
+                break  # no more audio left
+            chunk_path = audio_path.with_name(f"{audio_path.stem}.chunk{i:03d}.mp3")
+            cmd = [
+                ffmpeg_cmd, '-y',
+                '-ss', str(start),
+                '-i', str(audio_path),
+                '-t', str(chunk_duration),
+                '-acodec', 'copy',   # fast copy, no re-encode
+                str(chunk_path),
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            if result.returncode != 0:
+                raise RuntimeError(f"Failed to split chunk {i}: {result.stderr[-300:]}")
+            if chunk_path.exists() and chunk_path.stat().st_size > 0:
+                chunk_paths.append(chunk_path)
+
+        print(f"  Created {len(chunk_paths)} chunk(s)")
+        return chunk_paths, chunk_duration
 
     # ── Cost estimation ───────────────────────────────────────────────────────
 
@@ -184,6 +334,7 @@ class AudioTranscriber:
                 f"File size ({file_size_mb:.1f}MB) exceeds OpenAI's 25MB limit. "
                 "Use --extract-audio to compress, or split the file."
             )
+        print(f"  File size: {file_size_mb:.1f}MB")
 
         try:
             with open(file_path, 'rb') as audio_file:
@@ -485,9 +636,33 @@ class AudioTranscriber:
         else:
             processing_file = file_path
 
+        # Split into chunks if still over 25 MB or over duration limit
+        chunk_paths: List[Path] = []
+        chunk_dur = 0
         try:
-            # Transcribe
-            segments = self.transcribe_with_diarization(processing_file, model=model)
+            chunk_paths, chunk_dur = self._split_audio(processing_file)
+        except Exception as e:
+            raise RuntimeError(f"Failed to prepare audio: {e}")
+
+        try:
+            # Transcribe (possibly across multiple chunks)
+            all_segments: List[Dict] = []
+
+            for idx, chunk in enumerate(chunk_paths):
+                if len(chunk_paths) > 1:
+                    print(f"  -- Chunk {idx + 1}/{len(chunk_paths)} --")
+                chunk_segments = self.transcribe_with_diarization(chunk, model=model)
+
+                # Offset timestamps for chunks beyond the first
+                if idx > 0 and chunk_dur > 0:
+                    time_offset = idx * chunk_dur
+                    for seg in chunk_segments:
+                        seg['start'] = seg.get('start', 0) + time_offset
+                        seg['end']   = seg.get('end', 0)   + time_offset
+
+                all_segments.extend(chunk_segments)
+
+            segments = all_segments
             metadata = self.get_metadata(segments)
 
             # Track transcription cost
@@ -536,6 +711,13 @@ class AudioTranscriber:
             }
 
         finally:
+            # Clean up temporary files
+            for tmp in chunk_paths:
+                if tmp != processing_file and tmp.exists():
+                    try:
+                        tmp.unlink()
+                    except Exception:
+                        pass
             if extracted_audio_path and extracted_audio_path.exists():
                 try:
                     extracted_audio_path.unlink()
